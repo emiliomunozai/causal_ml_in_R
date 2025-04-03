@@ -4,3 +4,5 @@
 .Ruserdata
 Avance 3/Bases/modelo_causal_forest.RData
 *.RData
+*.RData
+*.csv
