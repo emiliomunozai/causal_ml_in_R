@@ -1,0 +1,165 @@
+---
+title: "Proyecto Final: Avance 1"
+author: "Emilio Muñoz"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Objetivo
+
+El objetivo de este avance es realizar una asignación aleatoria estratificada de los clientes inactivos. Esto con la finalidad de determinar los grupos de clientes que recibirán un tipo de comunicación específica en la estrategia experimental.
+
+## Instalación de librerías
+
+```{r cargar-base}
+required_pkgs <- c('tidyverse','RCT','fastDummies','kableExtra')
+installed_pkgs <- installed.packages()
+missing_pkgs <- required_pkgs[!(required_pkgs %in% installed_pkgs[, 1])]
+if (length(missing_pkgs) == 0 ) {
+  message("Librerias cargadas")
+} else {
+  install.packages(missing_pkgs)
+  message("Instalacion completa")
+}
+rm(installed_pkgs, missing_pkgs)
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+rm(required_pkgs)
+```
+
+## Pregunta 1
+
+Explora la base de datos de clientes nuevos. ¿A qué nivel de desagregación está la base? ¿Cuántos clientes únicos? ¿Qué variables tienen valores vacíos? Decide si debes excluir a esas observaciones o mantenerlas y justifica tu decisión.
+
+```{r cargar-base}
+#Cargamos la base
+load("Bases/base_inactivos.RData")
+
+#Exploramos la base
+glimpse(inactivos_db)
+```
+
+```{r clientes-unicos}
+# La base está a nivel cliente (numero_cliente). Con 78,593 observaciones únicas.
+length(unique(inactivos_db$numero_cliente))
+```
+
+```{r valores-faltantes}
+# Valores faltantes
+missings <- map_dbl(inactivos_db %>% select_all(),
+                   ~100*sum(is.na(.))/nrow(inactivos_db))
+missings[missings>0]
+```
+
+**Respuesta**: Si bien se tienen valores vacios en las variables tipo de dispositivo, canal de marketing, productos de interés, y tipo de producto, la falta de información no impide el proceso de asignación. Por lo tanto, decidimos mantener todas las observaciones para el análisis.
+
+## Pregunta 2
+
+¿Qué variables crees que puedan estar más correlacionadas con el impacto del tratamiento?
+
+**Respuesta**: Las variables organico, registro_newsletter, abrio_mail, descargo_app y visitas web podrían indicar el interés del usuario por adquirir un producto y por lo tanto vale considerarlas en la estratificación para eliminar cualquier sesgo posible.
+
+Existen otras variables que resultarían intersantes de analizar en la evaluación de impacto tales como el costo de adquisición y la indicadora de productos en el carrito de compra. La estratificación por costo de adquisición nos permitirá conocer si aquellos usuarios con un mayor costo de adquisición son más rentables. Por su parte, la variable de si el cliente agregó un artículo al carrito nos dirá si la promoción resultó el empujón necesario para completar la compra.
+
+## Pregunta 3
+
+Realiza una asignación aleatoria de la población de clientes en 3 grupos de tamaño similar. El grupo asignado determinará el tipo de promoción que recibirán.
+
+```{r asignacion}
+#Variablesestratificadoras
+inactivos_db <- inactivos_db %>%
+  mutate(
+    grupo_cac=ntile(costo_adquisicion,4),
+    agrego_articulo=if_else(articulos_carrito==0,0,1))
+#Asignación
+asignacion<-treatment_assign(
+  inactivos_db,
+  share_control=.33,
+  n_t=2,
+  strata_varlist=vars(
+    organico,
+    registro_newsletter,
+    abrio_mail,
+    descargo_app,
+    agrego_articulo,
+    grupo_cac),
+  seed=2000,
+  key= 'numero_cliente',
+  missfits = "fail" )
+
+list2env(asignacion,envir=.GlobalEnv)
+
+```
+
+```{r}
+#Juntamoslabasedeclientesinactivosconeluniversoasignado.
+inactivos_db<-left_join(
+ inactivos_db,
+ data,
+ by="numero_cliente")
+```
+
+## Pregunta 4
+
+Realiza las pruebas de balance sobre todas las variables. ¿Están balanceadas las variables entre los 3 grupos?
+
+```{r}
+#Transformar las variables de texto en categóricas para poder incluirlas
+#en la prueba de balance
+inactivos_db_aux <- inactivos_db %>%
+  dummy_cols(
+    select_columns=c(
+      "genero",
+      "dispositivo",
+      "canal_marketing",
+      "productos_interes",
+      "tipo_producto",
+      "localidad"),
+    ignore_na=T,remove_selected_columns= T) %>%
+  mutate_at(vars(c(starts_with(c("genero","dispositivo","canal_marketing",
+"productos_interes","tipo_producto","localidad")))),
+function(x)x=if_else(is.na(x),0,as.double(x)))
+
+#Tabla de balance
+balance_tab <- balance_table(data = inactivos_db_aux %>% select(-c(numero_cliente,email)),treatment = 'treat')
+
+kable(balance_tab, caption = "Tabla de balance", digits = 2)
+```
+
+**Interpretación**: De acuerdo con la tabla de balance, podemos observar que las variables están correctamente balanceadas entre los tres grupos. Los valores p son mayores a 0.05 en la gran mayoría de los casos, lo que indica que no hay diferencias estadísticamente significativas entre los grupos para estas variables. Esto confirma que nuestra asignación aleatoria estratificada ha funcionado correctamente.
+
+## Exportación de datos para marketing
+
+Guardamos la base en un archivo csv para poder compartirlo con el equipo de marketing y programar los envíos. El archivo especifica el grupo de pertenencia del usuario y el tratamiento a recibir.
+
+```{r exportar}
+inactivos_marketing <- inactivos_db%>%
+select(numero_cliente,email,treat)%>%
+mutate(treat = case_when(treat==0 ~ "Sin Comunicacion",
+treat==1 ~ "Promocion Cashback",
+treat==2 ~ "Promocion Descuento"))
+fwrite(inactivos_marketing, file = "inactivos_marketing.csv")
+```
+
+## Conclusiones
+
+En este avance hemos logrado realizar una asignación aleatoria estratificada de los clientes inactivos para la estrategia experimental. Los principales logros incluyen:
+
+1.  Exploración de la base de datos y análisis de valores faltantes
+2.  Identificación de variables clave para la estratificación
+3.  Asignación aleatoria en tres grupos (un control y dos tratamientos)
+4.  Verificación del balance adecuado entre los grupos
+5.  Preparación de los datos para el equipo de marketing
+
+Los tres grupos formados recibirán diferentes comunicaciones: - Grupo control: Sin comunicación - Tratamiento 1: Promoción Cashback - Tratamiento 2: Promoción Descuento
+
+Esta asignación permitirá evaluar de manera efectiva el impacto de las diferentes estrategias de comunicación en la reactivación de clientes.

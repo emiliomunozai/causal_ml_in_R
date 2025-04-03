@@ -1,0 +1,313 @@
+---
+title: "Proyecto Final: Causal Machine Learning para Estrategia de Descuentos"
+author: "Emilio"
+date: "2025-04-03"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Objetivo del Proyecto
+
+Este proyecto tiene como objetivo estimar un modelo de Causal Machine Learning para predecir el impacto de otorgar un descuento a nivel cliente, específicamente la demanda incremental en las compras derivada de la promoción. Los resultados del modelo se utilizarán para implementar una estrategia de descuentos focalizada que maximice la rentabilidad.
+
+## Instalación de librerías
+
+```{r}
+required_pkgs <- c('tidyverse', 'dplyr', 'RCT', 'grf', "fastDummies")
+installed_pkgs <- installed.packages()
+missing_pkgs <- required_pkgs[!(required_pkgs %in% installed_pkgs[,1])]
+if(length(missing_pkgs) == 0) {
+  message("Librerías cargadas")
+} else {
+  install.packages(missing_pkgs)
+  message("Instalación completa")
+}
+rm(installed_pkgs, missing_pkgs)
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+rm(required_pkgs)
+```
+
+## 1. Exploración y preparación de datos
+
+En esta sección, exploramos la base de datos para asegurarnos de que todas las variables estén en formato numérico. Las variables de texto o factores se transforman en variables categóricas, y se abordan los valores faltantes.
+
+```{r}
+# Cargar la base
+load("Bases/inactivos_evaluacion.RData")
+
+# Explorar la base
+# glimpse(inactivos_db)
+
+# Generar la comparativa de medias
+inactivos_db <- inactivos_db %>%
+  mutate(grupo_edad = ntile_label(edad, 4, 0)) %>%
+  dummy_cols(select_columns = c("genero", "dispositivo", "canal_marketing",
+                              "productos_interes", "tipo_producto",
+                              "localidad", "grupo_edad"),
+            ignore_na = T, remove_selected_columns = T) %>%
+  mutate_at(vars(c(starts_with(c("genero", "dispositivo", "canal_marketing",
+                              "productos_interes", "tipo_producto", "localidad")))),
+          function(x) x = if_else(is.na(x), 0, as.double(x))) %>%
+  select(-c(email, edad, strata, missfit))
+
+# Quitar caracteres especiales del nombre de las columnas
+names(inactivos_db) <- make.names(names(inactivos_db))
+
+# Analizar la distribución de las variables
+summary_stat <- summary_statistics(inactivos_db %>%
+                                select(-c(numero_cliente, treat, treatment)))
+
+# Winzorizar las variables con outliers
+inactivos_db <- inactivos_db %>%
+  mutate_at(vars(monto_compra, valor_carrito, visitas_web, login_app),
+          function(x) x = if_else(x > quantile(x, probs = 0.99, na.rm = T),
+                                quantile(x, probs = 0.99, na.rm = T), x))
+
+# Valores faltantes
+missings <- map_dbl(inactivos_db %>% select_all(),
+                  ~100*sum(is.na(.))/nrow(inactivos_db))
+missings[missings > 0]
+```
+
+Tras la exploración inicial, se observa que los datos no presentan valores faltantes significativos, lo que facilita su análisis. Se han aplicado técnicas de winsorización para controlar valores extremos en variables clave como monto de compra, valor del carrito, visitas web y login app, limitándolos al percentil 99 para evitar distorsiones en los análisis posteriores.
+
+## 2. Análisis de correlaciones y eliminación de multicolinealidad
+
+En esta sección, se estima una matriz de correlaciones para identificar pares de variables con correlación superior al 95% y eliminar una de cada par para evitar problemas de multicolinealidad.
+
+```{r}
+# Construir la matriz de correlación
+cor_matrix <- cor(inactivos_db %>%
+                select(-c(numero_cliente, treat, treatment)))
+cor_matrix[upper.tri(cor_matrix, diag = T)] = NA
+cor_tibble <- tibble(row = rep(rownames(cor_matrix), ncol(cor_matrix)),
+                   col = rep(colnames(cor_matrix), each = ncol(cor_matrix)),
+                   cor = as.vector(cor_matrix))
+cor_tibble <- cor_tibble %>% filter(!is.na(cor))
+large_cor_tibble <- cor_tibble %>% filter(abs(cor) >= 0.95)
+
+# Eliminar variables altamente correlacionadas
+inactivos_db <- inactivos_db %>% select(-all_of(large_cor_tibble$col))
+
+# Guardar la base de estimación
+save(inactivos_db, file = "Bases/inactivos_estimacion.RData")
+```
+
+El análisis de correlación ha permitido identificar variables altamente correlacionadas (≥95%) que podrían introducir redundancia en el modelo. Estas variables han sido eliminadas para garantizar la estabilidad y precisión del modelo causal forestal que se estimará posteriormente. La eliminación de multicolinealidad es crucial para obtener estimaciones confiables del efecto de tratamiento.
+
+## 3. División de la muestra
+
+Seleccionamos únicamente clientes del grupo de control y el tratamiento con descuento, y dividimos aleatoriamente la población en una muestra de entrenamiento (70%) y una muestra de validación (30%).
+
+```{r}
+inactivos_db <- inactivos_db %>%
+  filter(treat != 1)
+
+inactivos_db <- inactivos_db %>%
+  mutate(training_set = rbinom(n = nrow(inactivos_db), 1, 0.7))
+
+inactivos_training <- inactivos_db %>% filter(training_set == 1)
+```
+
+La división de datos en conjuntos de entrenamiento y validación nos permitirá posteriormente evaluar el rendimiento del modelo en datos no utilizados durante la fase de entrenamiento, garantizando así su capacidad de generalización.
+
+## 4. Estimación del Causal Forest
+
+Estimamos un modelo de Causal Forest utilizando la muestra de entrenamiento, con 3,000 árboles para capturar la heterogeneidad en el efecto del tratamiento.
+
+```{r}
+# Crear el set de covariables
+X <- inactivos_training %>%
+  select(-c(numero_cliente, treat, treatment, compra,
+           valor_compra, training_set))
+X <- as.matrix(X)
+
+# Generar el vector del grupo de tratamiento
+treat <- inactivos_training$treat
+valor_compra <- inactivos_training$valor_compra
+
+t0 <- Sys.time()
+causal_hte <- causal_forest(X = X, Y = valor_compra, W = treat, num.trees = 3000)
+t1 <- Sys.time()
+t1 - t0
+
+# Guardar el modelo
+save(causal_hte, file = "Bases/modelo_causal_forest.RData")
+```
+
+El modelo Causal Forest es particularmente adecuado para este análisis debido a su capacidad para capturar efectos heterogéneos del tratamiento, permitiéndonos identificar qué clientes responden mejor a los descuentos. La implementación de 3,000 árboles proporciona robustez y estabilidad en las estimaciones.
+
+## 5. Distribución del impacto de tratamiento
+
+Analizamos la distribución del impacto de tratamiento estimado por el modelo y comparamos el efecto promedio con el encontrado en el experimento.
+
+```{r}
+tau_in_sample = predict(causal_hte, estimate.variance = TRUE)
+inactivos_training <- bind_cols(inactivos_training, tau_in_sample)
+rm(tau_in_sample)
+
+ggplot(inactivos_training) +
+  geom_histogram(aes(predictions), bins = 100,
+               fill = 'lightsteelblue', color = 'darkgrey') +
+  theme_bw() +
+  labs(title = "Distribución de Impacto Estimado",
+       x = 'Impacto del Descuento sobre Monto de Compra ($)', y = 'Número de clientes') +
+  theme(axis.text = element_text(size = 10.5),
+       text = element_text(size = 12), legend.position = 'bottom')
+
+# Predicción del efecto promedio de tratamiento
+average_treatment_effect(causal_hte)
+
+# Analizar la importancia de las variables en el criterio de particion de los arboles
+var_importance <- variable_importance(causal_hte)
+var_importance <- as.data.frame(var_importance)
+var_importance <- var_importance %>%
+  mutate(variable = colnames(X)) %>%
+  rename(Importancia = V1)
+
+# Graficar la importancia de las variables
+ggplot(var_importance %>% filter(Importancia > 0.01)) +
+  geom_col(aes(fct_reorder(variable, Importancia), Importancia, fill = variable)) +
+  coord_flip() + theme_bw() + theme(legend.position = "none") + labs(x = "")
+
+rm(cor_matrix, cor_tibble, summary_stat, large_cor_tibble, X,
+  var_importance, treat, valor_compra, missings)
+```
+
+El análisis revela que el efecto promedio del tratamiento es de aproximadamente \$2.28, lo que indica que, en promedio, ofrecer un descuento aumenta el valor de compra en esta cantidad. Sin embargo, la distribución del impacto muestra una considerable heterogeneidad, con algunos clientes presentando efectos negativos (posible canibalización de ventas futuras) y otros mostrando respuestas muy positivas.
+
+Las variables más importantes para predecir la heterogeneidad del efecto incluyen características relacionadas con el comportamiento previo de compra, la demografía del cliente y sus interacciones con la plataforma. Esta información es crucial para diseñar una estrategia de descuentos focalizada.
+
+## 6. Evaluación del poder predictivo
+
+Evaluamos el poder predictivo del modelo en la base de validación, dividiendo en deciles según el score de predicción y comparando el impacto observado con el predicho.
+
+```{r}
+inactivos_validation <- inactivos_db %>% filter(training_set == 0)
+
+# Creamos el set de covariables de la validación
+X <- inactivos_validation %>%
+  select(-c(numero_cliente, treat, treatment, compra,
+           valor_compra, training_set))
+X <- as.matrix(X)
+
+# Realizamos la predicción
+inactivos_validation <- inactivos_validation %>%
+  mutate(predictions = predict(causal_hte, newdata = X)$predictions)
+
+summary(inactivos_validation$predictions)
+
+# Crear los deciles por score predicho
+inactivos_validation <- inactivos_validation %>%
+  mutate(score_group = as.integer(ntile(predictions, n = 10)))
+
+# Checando poder de predicción
+ITT <- impact_eval(inactivos_validation,
+                 endogenous_vars = "valor_compra",
+                 treatment = "treat",
+                 heterogenous_vars = "score_group")
+ITT_score <- ITT$valor_compra_score_group
+ITT_score <- ITT_score %>% filter(term != "(Intercept)")
+rm(ITT)
+
+score_table <- inactivos_validation %>%
+  group_by(score_group) %>%
+  summarise(tau_predict = mean(predictions))
+
+ITT_score <- left_join(ITT_score %>%
+                     select(score_group, estimate) %>%
+                     rename(tau_obs = estimate), score_table, by = "score_group")
+
+ITT_score <- ITT_score %>%
+  pivot_longer(cols = c(tau_predict, tau_obs))
+
+ggplot(ITT_score, aes(x = score_group, y = value, color = name)) + geom_line() +
+  geom_point(shape = 21, size = 2) +
+  labs(title = "Validación del Modelo",
+       x = "Decil de Impacto", y = "Impacto Promedio ($)") +
+  theme_bw() + geom_hline(yintercept = 0) +
+  theme(axis.text = element_text(size = 12),
+       text = element_text(size = 12), legend.position = "bottom") +
+  scale_x_continuous(breaks = seq(0, 10, 1))
+
+rm(X, score_table, ITT_score, inactivos_training, inactivos_validation)
+```
+
+La validación del modelo muestra un patrón creciente en los efectos observados a medida que aumenta el decil de impacto predicho, lo que confirma la capacidad del modelo para identificar correctamente a los clientes más receptivos a los descuentos. La correlación entre los valores predichos y observados es particularmente fuerte en los deciles superiores, lo que sugiere que el modelo es especialmente efectivo para identificar a los clientes con mayor potencial de respuesta.
+
+En los deciles inferiores se observa cierta discrepancia entre predicciones y observaciones, lo que podría indicar la presencia de factores no capturados por el modelo que influyen en la respuesta de estos clientes. Sin embargo, para el propósito de focalización, este desempeño es adecuado, ya que nos interesa principalmente identificar a los clientes con mayor potencial de respuesta positiva.
+
+## 7. Simulación de estrategia focalizada
+
+Predicimos cuál hubiera sido el impacto sobre las ventas si los clientes que recibieron cashback hubieran recibido un descuento, y simulamos una estrategia de focalización a nivel usuario.
+
+```{r}
+load("Bases/inactivos_estimacion.RData")
+inactivos_focalizacion <- inactivos_db %>%
+  filter(treat == 1)
+
+# Generando el vector de covariables
+X <- inactivos_focalizacion %>%
+  select(-c(numero_cliente, treat,
+           treatment, compra, valor_compra))
+
+# Revisar que todas las covariables del modelo estén en la matrix
+variables_modelo <- colnames(causal_hte$X.orig)
+en_ambas <- intersect(variables_modelo, names(X))
+variables_faltantes <- setdiff(variables_modelo, names(X))
+
+X <- as.matrix(X)
+
+# Realizar la predicción
+inactivos_focalizacion <- inactivos_focalizacion %>%
+  mutate(predictions = predict(causal_hte, newdata = X)$predictions)
+
+summary(inactivos_focalizacion$predictions)
+
+# Filtrar primeros 1000 clientes más responsivos
+inactivos_focalizacion <- inactivos_focalizacion %>%
+  filter(rank(desc(predictions)) <= 1000 & predictions > 7)
+
+# Impacto promedio e impacto total
+lift_table <- inactivos_focalizacion %>%
+  group_by() %>%
+  summarise(impacto_promedio = mean(predictions),
+           impacto_esperado = impacto_promedio * 1000 * 0.2080256)
+
+# Mostrar resultados
+lift_table
+```
+
+## Conclusiones y Recomendaciones
+
+El análisis realizado demuestra el potencial de las técnicas de Causal Machine Learning para optimizar estrategias de descuentos personalizados. Basado en los resultados obtenidos, podemos extraer las siguientes conclusiones:
+
+1.  **Heterogeneidad significativa**: Existe una gran variabilidad en cómo los clientes responden a los descuentos, lo que justifica una estrategia focalizada en lugar de descuentos generalizados.
+
+2.  **Precisión predictiva**: El modelo muestra una buena capacidad para identificar a los clientes con mayor potencial de respuesta positiva a los descuentos, como se evidencia en la validación por deciles.
+
+3.  **Factores determinantes**: Las variables relacionadas con el comportamiento previo de compra, el valor del carrito y la interacción con la plataforma (visitas web, minutos en página) son especialmente importantes para predecir la respuesta a los descuentos.
+
+4.  **Retorno sobre inversión**: Al seleccionar los 1000 clientes con mayor impacto predicho y un umbral mínimo de \$7, podemos esperar un impacto promedio significativo por cliente y un impacto total considerable en las ventas.
+
+**Recomendaciones**:
+
+1.  Implementar una estrategia de descuentos focalizados dirigida específicamente a los clientes identificados como más receptivos.
+
+2.  Considerar diferentes niveles de descuento según la magnitud del impacto predicho para maximizar el ROI.
+
+3.  Establecer un sistema de monitoreo continuo para evaluar el desempeño real de la estrategia y ajustarla según sea necesario.
+
+4.  Utilizar la información sobre las variables más importantes para mejorar las estrategias de marketing futuras, optimizando la experiencia del cliente en aquellos aspectos que más influyen en su comportamiento de compra.
+
+5.  Explorar la posibilidad de combinar los descuentos con otras estrategias de marketing personalizado para potenciar aún más el impacto en ventas.
+
+Esta aproximación basada en aprendizaje causal representa un avance significativo respecto a las estrategias tradicionales de marketing, permitiendo una personalización efectiva que beneficia tanto a la empresa como a los clientes, mejorando la eficiencia de los recursos de marketing y la satisfacción del cliente.

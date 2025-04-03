@@ -1,0 +1,214 @@
+---
+title: "Proyecto Final: Avance 1 Solucion"
+author: "Emilio Munoz"
+date: "202504"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Objetivo
+
+El objetivo de este avance es realizar una evaluación de impacto del experimento y determinar qué opción fue más efectiva para incrementar las ventas y para qué perfil de cliente.
+
+## Instalación de librerías
+
+```{r libraries}
+required_pkgs <- c('tidyverse', 'RCT', 'writexl', "scales")
+installed_pkgs <- installed.packages()
+missing_pkgs <- required_pkgs[!(required_pkgs %in% installed_pkgs[,1])]
+
+if(length(missing_pkgs) == 0) {
+  message("Librerias cargadas")
+} else {
+  install.packages(missing_pkgs)
+  message("Instalacion completa")
+}
+
+rm(installed_pkgs, missing_pkgs)
+
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+rm(required_pkgs)
+```
+
+## Pregunta 1
+
+Realiza una comparación del porcentaje de conversiones y el valor promedio de las ventas entre los 3 distintos grupos de clientes. ¿Observas alguna diferencia entre los grupos?
+
+**Respuesta:** Se observa que el grupo que recibió la promoción del descuento exhibió un porcentaje más alto de conversiones y también montos de compra más elevados.
+
+```{r data_load}
+# Cargamos la base
+load("Bases/inactivos_evaluacion.RData")
+
+# Valores faltantes
+missings <- map_dbl(inactivos_db %>% select_all(),
+                  ~100*sum(is.na(.))/nrow(inactivos_db))
+missings[missings > 0]
+```
+
+```{r group_means}
+# Generamos la comparativa de medias
+medias_grupo <- inactivos_db %>%
+  group_by(treatment) %>%
+  summarise(porcentaje_compra = 100*mean(compra, na.rm = T),
+            valor_prom_compra = round(mean(valor_compra, na.rm = T), 1))
+```
+
+```{r purchase_prob_plot, fig.width=10, fig.height=6}
+## Grafica Probabilidad Compra
+ggplot(medias_grupo, aes(x = fct_inorder(treatment), y = porcentaje_compra, fill = treatment)) +
+  geom_bar(stat = "identity") + theme_bw() +
+  geom_text(aes(label = comma(round(porcentaje_compra, 1))), vjust = -0.5, size = 4.5) +
+  geom_hline(yintercept = medias_grupo$porcentaje_compra[1], linetype = "dashed") +
+  labs(title = "Probabilidad de Compra por Grupo",
+       y = "Porcentaje de Compra (%)", x = "Grupo de Tratamiento") +
+  theme(axis.text = element_text(size = 12), axis.text.x = element_text(angle = 0),
+        text = element_text(size = 12),
+        strip.text.x = element_text(size = 12), legend.position = "bottom") +
+  scale_y_continuous(label = comma, limits = c(0, 25), breaks = seq(0, 25, by = 5))
+```
+
+```{r purchase_amount_plot, fig.width=10, fig.height=6}
+## Grafica Monto Compra
+ggplot(medias_grupo, aes(x = fct_inorder(treatment), y = valor_prom_compra, fill = treatment)) +
+  geom_bar(stat = "identity") + theme_bw() +
+  geom_text(aes(label = comma(round(valor_prom_compra, 1))), vjust = -0.5, size = 4.5) +
+  geom_hline(yintercept = medias_grupo$valor_prom_compra[1], linetype = "dashed") +
+  labs(title = "Monto Promedio de Compra por Grupo",
+       y = "Porcentaje de Compra (%)", x = "Grupo de Tratamiento") +
+  theme(axis.text = element_text(size = 12), axis.text.x = element_text(angle = 0),
+        text = element_text(size = 12),
+        strip.text.x = element_text(size = 12), legend.position = "bottom") +
+  scale_y_continuous(label = comma, limits = c(0, 21), breaks = seq(0, 20, by = 5))
+```
+
+## Pregunta 2
+
+Estima una regresión de evaluación de impacto de los efectos de tratamiento (ITT). Incluye efectos fijos por estrato en tu especificación. Reporta en una tabla el efecto promedio para cada grupo de tratamiento y su significancia estadística correspondiente.
+
+```{r impact_evaluation}
+resultados_itt <- impact_eval(data = inactivos_db,
+                             endogenous_vars = c("compra", "valor_compra"),
+                             treatment = "treat",
+                             fixed_effect_vars = "strata")
+
+list2env(resultados_itt, envir = .GlobalEnv)
+
+write_xlsx(resultados_itt, "Bases/resultados_itt.xlsx")
+```
+
+```{r itt_coefficients}
+# Coeficientes de variable compra
+coef_compra <- compra %>%
+  mutate(term = parse_number(term),
+         p.value_compra = str_c("p=", round(p.value, digits = 2)),
+         treatment = as.factor(if_else(term == 1, "Promocion Cashback",
+                              "Promocion Descuento"))) %>%
+  rename(prob_compra = estimate) %>%
+  select(treatment, prob_compra, p.value_compra)
+
+# Coeficientes de variable valor de compra
+coef_valor_compra <- valor_compra %>%
+  mutate(term = parse_number(term),
+         p.value_valor_compra = str_c("p=", round(p.value, digits = 2)),
+         treatment = as.factor(if_else(term == 1, "Promocion Cashback",
+                              "Promocion Descuento"))) %>%
+  rename(valor_compra = estimate) %>%
+  select(treatment, valor_compra, p.value_valor_compra)
+
+impactos <- left_join(coef_compra, coef_valor_compra, by = "treatment")
+medias_grupo <- left_join(medias_grupo, impactos, by = "treatment")
+
+# Mostramos la tabla de resultados
+knitr::kable(medias_grupo, caption = "Impacto del tratamiento en compras y valor")
+
+rm(list = setdiff(ls(), c("inactivos_db", "medias_grupo")))
+```
+
+## Pregunta 3
+
+Realiza las pruebas de balance sobre todas las variables. ¿Están balanceadas las variables entre los 3 grupos?
+
+**Respuesta:** Los clientes registrados al newsletter reflejaron un mayor porcentaje de conversiones y montos de compra más altos respecto a los no registrados. Adicionalmente, los usuarios que descargaron la aplicación incrementaron su probabilidad de compra en 11% y el valor de la misma en 10 dólares respecto a aquellos que no recibieron comunicación.
+
+Por su parte, los clientes que son más caros de adquirir (mayor cac) registraron menores tasas de conversión y menores montos de compra respecto a los clientes con un menor costo de adquisicion.
+
+```{r heterogeneous_impact}
+resultados_hte <- impact_eval(data = inactivos_db,
+                             endogenous_vars = c("compra", "valor_compra"),
+                             treatment = "treat",
+                             heterogenous_vars = c("organico", "registro_newsletter",
+                                                 "descargo_app", "agrego_articulo",
+                                                 "grupo_cac"),
+                             fixed_effect_vars = "strata")
+
+write_xlsx(resultados_hte, "Bases/resultados_hte.xlsx")
+```
+
+```{r app_download_impact, fig.width=10, fig.height=6}
+# Ejemplo: Impactos heterogeneos por descarga app
+# Probabilidad de compra
+compra_descargo_app <- resultados_hte$compra_descargo_app %>%
+  rename(impacto_prob_compra = estimate) %>%
+  mutate(impacto_prob_compra = impacto_prob_compra*100,
+         term = parse_number(term),
+         p.value_compra = str_c("p=", round(p.value, digits = 2)),
+         descargo_app = as.factor(if_else(descargo_app == 0, "Sin Descarga App",
+                                 "Con Descarga App")),
+         treatment = as.factor(if_else(term == 1, "Cashback", "Descuento"))) %>%
+  select(descargo_app, treatment, impacto_prob_compra, p.value_compra)
+
+ggplot(compra_descargo_app,
+       aes(x = fct_inorder(treatment), y = impacto_prob_compra, fill = treatment)) +
+  geom_bar(stat = "identity") + theme_bw() +
+  geom_text(aes(label = comma(round(impacto_prob_compra))), vjust = -0.5, size = 4.5) +
+  geom_text(aes(treatment, y = 14, label = p.value_compra),
+           color = "black", alpha = 0.5, inherit.aes = F, size = 4.5) +
+  labs(y = "Impacto Promedio sobre\nProbabilidad de Compra (%)",
+       x = "Grupos de Tratamiento") +
+  theme(axis.text = element_text(size = 12), axis.text.x = element_text(angle = 0),
+        text = element_text(size = 12),
+        strip.text.x = element_text(size = 12), legend.position = "bottom") +
+  facet_wrap(~descargo_app)
+```
+
+```{r purchase_value_impact, fig.width=10, fig.height=6}
+# Valor de compra
+valor_compra_descargo_app <- resultados_hte$valor_compra_descargo_app %>%
+  rename(impacto_valor_compra = estimate) %>%
+  mutate(term = parse_number(term),
+         p.value_valor_compra = str_c("p=", round(p.value, digits = 2)),
+         descargo_app = as.factor(if_else(descargo_app == 0, "Sin Descarga App",
+                                 "Con Descarga App")),
+         treatment = as.factor(if_else(term == 1, "Cashback", "Descuento"))) %>%
+  select(descargo_app, treatment, impacto_valor_compra, p.value_valor_compra)
+
+ggplot(valor_compra_descargo_app,
+       aes(x = fct_inorder(treatment), y = impacto_valor_compra, fill = treatment)) +
+  geom_bar(stat = "identity") + theme_bw() +
+  geom_text(aes(label = comma(round(impacto_valor_compra, 1))), vjust = -0.5, size = 4.5) +
+  geom_text(aes(treatment, y = 12, label = p.value_valor_compra),
+           color = "black", alpha = 0.5, inherit.aes = F, size = 4.5) +
+  labs(y = "Impacto Promedio sobre\nValor de Compra (%)", x = "Grupos de Tratamiento") +
+  theme(axis.text = element_text(size = 12), axis.text.x = element_text(angle = 0),
+        text = element_text(size = 12),
+        strip.text.x = element_text(size = 12), legend.position = "bottom") +
+  facet_wrap(~descargo_app)
+```
+
+## Pregunta 4
+
+¿Qué puedes concluir de la evaluación experimental? ¿Cuál sería tu recomendación para la empresa? ¿Vale la pena centrarse en un grupo específico de clientes?
+
+**Respuesta:** Los resultados muestran que otorgar un descuento es más efectivo que un cashback para incrementar las compras y sus volúmenes.
+
+Destaca que, si bien el impacto de tratamiento es estadísticamente significativo a nivel general. Existen subgrupos de clientes con características específicas que los vuelven más (menos) sensibles a realizar una compra cuando se les otorga un descuento.
+
+En este sentido, la heterogeneidad del impacto de tratamiento sugiere que una estrategia focalizada podría potencializar los beneficios y rentabilidad de las promociones.
